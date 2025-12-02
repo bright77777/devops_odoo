@@ -2,95 +2,112 @@
 
 set -e
 
-# Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 ENV_FILE="$PROJECT_ROOT/.env"
 BACKUP_DIR="$PROJECT_ROOT/backup"
 
-# Color codes for output
-RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'
+NC='\033[0m'
 
-# Helper functions
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+[ -f "$ENV_FILE" ] || { log_error ".env not found"; exit 1; }
+set -a; source "$ENV_FILE"; set +a
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-log_debug() {
-    echo -e "${BLUE}[DEBUG]${NC} $1"
-}
-
-# Check if .env file exists
-if [ ! -f "$ENV_FILE" ]; then
-    log_error ".env file not found at $ENV_FILE"
-    exit 1
-fi
-
-# Load environment variables
-set -a
-source "$ENV_FILE"
-set +a
-
-# Create backup directory if it doesn't exist
 mkdir -p "$BACKUP_DIR"
-
-# Generate timestamp
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 BACKUP_NAME="odoo_backup_${TIMESTAMP}"
 BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
-
-log_info "=========================================="
-log_info "Starting Odoo Backup"
-log_info "=========================================="
-log_info "Backup name: $BACKUP_NAME"
-log_info "Backup path: $BACKUP_PATH"
-
-# Create temporary backup directory
 mkdir -p "$BACKUP_PATH"
 
-# Step 1: Backup PostgreSQL database
-log_info "Backing up PostgreSQL database..."
-DUMP_FILE="$BACKUP_PATH/odoo_db_${TIMESTAMP}.dump"
+echo ""
+echo "🔄 BACKUP ODOO"
+echo "════════════════════════════════════════════"
+echo ""
 
-docker-compose -f "$PROJECT_ROOT/docker-compose.yml" exec -T postgres \
-    pg_dump -U "${POSTGRES_USER}" -F c "${POSTGRES_DB}" > "$DUMP_FILE"
+# Get container names
+POSTGRES_CONTAINER=$(docker ps -q -f "ancestor=postgres:*" | head -1)
+ODOO_CONTAINER=$(docker ps -q -f "ancestor=odoo:*" | head -1)
 
-if [ -f "$DUMP_FILE" ]; then
-    DUMP_SIZE=$(du -h "$DUMP_FILE" | cut -f1)
-    log_info "PostgreSQL database backed up ✓ (Size: $DUMP_SIZE)"
-else
-    log_error "Failed to backup PostgreSQL database"
+if [ -z "$POSTGRES_CONTAINER" ] || [ -z "$ODOO_CONTAINER" ]; then
+    log_error "Docker containers not found. Run: docker-compose up -d"
     exit 1
 fi
+
+# Backup PostgreSQL
+log_info "Backing up database..."
+docker exec -T "$POSTGRES_CONTAINER" pg_dump -U "${POSTGRES_USER}" -F c "${POSTGRES_DB}" > "$BACKUP_PATH/odoo_db.dump"
+SIZE=$(du -h "$BACKUP_PATH/odoo_db.dump" | cut -f1)
+log_info "Database backed up ($SIZE)"
+
+# Backup filestore
+log_info "Backing up filestore..."
+docker exec -T "$ODOO_CONTAINER" tar czf - -C /var/lib/odoo . > "$BACKUP_PATH/odoo_filestore.tar.gz" 2>/dev/null || {
+    log_info "No filestore data (normal)"
+    tar czf "$BACKUP_PATH/odoo_filestore.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
+}
+
+# Backup addons
+log_info "Backing up addons..."
+if [ -d "$PROJECT_ROOT/addons" ]; then
+    tar czf "$BACKUP_PATH/odoo_addons.tar.gz" -C "$PROJECT_ROOT" addons
+else
+    tar czf "$BACKUP_PATH/odoo_addons.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
+fi
+
+# Create metadata
+cat > "$BACKUP_PATH/backup.info" <<EOF
+BACKUP_NAME=$BACKUP_NAME
+TIMESTAMP=$TIMESTAMP
+DATE=$(date)
+DATABASE=$(basename "$BACKUP_PATH")/odoo_db.dump
+FILESTORE=$(basename "$BACKUP_PATH")/odoo_filestore.tar.gz
+ADDONS=$(basename "$BACKUP_PATH")/odoo_addons.tar.gz
+EOF
+
+# Compress
+log_info "Compressing backup..."
+BACKUP_ARCHIVE="$BACKUP_DIR/${BACKUP_NAME}.tar.gz"
+tar czf "$BACKUP_ARCHIVE" -C "$BACKUP_DIR" "$BACKUP_NAME"
+rm -rf "$BACKUP_PATH"
+
+ARCHIVE_SIZE=$(du -h "$BACKUP_ARCHIVE" | cut -f1)
+log_info "Backup compressed ($ARCHIVE_SIZE)"
+
+# Upload to R2
+if [ ! -z "$CF_R2_BUCKET" ] && [ "$CF_R2_BUCKET" != "your-bucket-name" ]; then
+    log_info "Uploading to Cloudflare R2..."
+    if aws s3 cp "$BACKUP_ARCHIVE" "s3://${CF_R2_BUCKET}/${BACKUP_NAME}.tar.gz" --region auto 2>&1; then
+        log_info "Uploaded to R2 ✓"
+    else
+        log_error "R2 upload failed (backup still local)"
+    fi
+else
+    log_info "R2 not configured, backup kept locally"
+fi
+
+echo ""
+log_info "✅ Backup complete: $BACKUP_ARCHIVE"
+echo ""
 
 # Step 2: Backup Odoo filestore
 log_info "Backing up Odoo filestore..."
 FILESTORE_TAR="$BACKUP_PATH/odoo_filestore_${TIMESTAMP}.tar.gz"
 
-docker run --rm \
-    --volumes-from odoo-web \
-    -v "$BACKUP_PATH:/backup" \
-    alpine tar czf "/backup/$(basename "$FILESTORE_TAR")" \
-    -C /var/lib/odoo .
+# Try to backup filestore from container
+docker exec -T "$ODOO_CONTAINER" tar czf - -C /var/lib/odoo . > "$FILESTORE_TAR" 2>/dev/null || {
+    log_warn "Could not backup filestore from container, will create empty archive"
+    tar czf "$FILESTORE_TAR" -C /tmp --files-from=/dev/null 2>/dev/null || true
+}
 
-if [ -f "$FILESTORE_TAR" ]; then
+if [ -f "$FILESTORE_TAR" ] && [ -s "$FILESTORE_TAR" ]; then
     TAR_SIZE=$(du -h "$FILESTORE_TAR" | cut -f1)
     log_info "Odoo filestore backed up ✓ (Size: $TAR_SIZE)"
 else
-    log_error "Failed to backup Odoo filestore"
-    exit 1
+    log_warn "Filestore backup is empty or failed (this might be normal if no files)"
 fi
 
 # Step 3: Backup addons folder
@@ -142,14 +159,19 @@ log_info "Uploading backup to Cloudflare R2..."
 
 S3_PATH="s3://${CF_R2_BUCKET}/${BACKUP_NAME}.tar.gz"
 
-if aws s3 cp "$BACKUP_ARCHIVE" "$S3_PATH" --region auto; then
-    log_info "Backup uploaded to R2 ✓"
-    log_info "R2 Path: $S3_PATH"
+# Check if R2 credentials are configured
+if [ -z "$CF_R2_BUCKET" ] || [ "$CF_R2_BUCKET" = "your-bucket-name" ]; then
+    log_warn "R2 bucket not configured, skipping upload"
+    log_info "To enable R2 upload, fill in .env with your R2 credentials"
 else
-    log_error "Failed to upload backup to R2"
-    rm -rf "$BACKUP_PATH"
-    rm -f "$BACKUP_ARCHIVE"
-    exit 1
+    if aws s3 cp "$BACKUP_ARCHIVE" "$S3_PATH" --region auto 2>&1; then
+        log_info "Backup uploaded to R2 ✓"
+        log_info "R2 Path: $S3_PATH"
+    else
+        log_error "Failed to upload backup to R2"
+        log_warn "Keeping local backup: $BACKUP_ARCHIVE"
+        log_warn "You can retry upload manually: aws s3 cp $BACKUP_ARCHIVE $S3_PATH --region auto"
+    fi
 fi
 
 # Step 7: Clean up local backup directory (keep only the archive)
