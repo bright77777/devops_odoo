@@ -114,20 +114,20 @@ sleep 2
 
 # Drop and recreate database
 log_info "Dropping database..."
-docker exec -T "$POSTGRES_CONTAINER" dropdb -U "${POSTGRES_USER}" "${POSTGRES_DB}" 2>/dev/null || true
+docker exec "$POSTGRES_CONTAINER" dropdb -U "${POSTGRES_USER}" "${POSTGRES_DB}" 2>/dev/null || true
 
 log_info "Creating database..."
-docker exec -T "$POSTGRES_CONTAINER" createdb -U "${POSTGRES_USER}" "${POSTGRES_DB}"
+docker exec "$POSTGRES_CONTAINER" createdb -U "${POSTGRES_USER}" "${POSTGRES_DB}"
 
 # Restore database
 log_info "Restoring database..."
-docker exec -T "$POSTGRES_CONTAINER" pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v < "$DUMP_FILE"
+docker exec "$POSTGRES_CONTAINER" pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v < "$DUMP_FILE"
 log_info "Database restored ✓"
 
 # Restore filestore
 if [ -f "$FILESTORE_TAR" ]; then
     log_info "Restoring filestore..."
-    docker exec -T "$ODOO_CONTAINER" rm -rf /var/lib/odoo/* 2>/dev/null || true
+    docker exec "$ODOO_CONTAINER" rm -rf /var/lib/odoo/* 2>/dev/null || true
     tar xzf "$FILESTORE_TAR" -C "$TEMP_DIR/extract"
     docker cp "$TEMP_DIR/extract/"* "$ODOO_CONTAINER":/var/lib/odoo/ 2>/dev/null || log_info "No filestore data"
 fi

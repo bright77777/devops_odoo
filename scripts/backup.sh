@@ -78,13 +78,13 @@ log_info "Found containers: PostgreSQL=$POSTGRES_CONTAINER, Odoo=$ODOO_CONTAINER
 
 # Backup PostgreSQL
 log_info "Backing up database..."
-docker exec -T "$POSTGRES_CONTAINER" pg_dump -U "${POSTGRES_USER}" -F c "${POSTGRES_DB}" > "$BACKUP_PATH/odoo_db.dump"
+docker exec "$POSTGRES_CONTAINER" pg_dump -U "${POSTGRES_USER}" -F c "${POSTGRES_DB}" > "$BACKUP_PATH/odoo_db.dump"
 SIZE=$(du -h "$BACKUP_PATH/odoo_db.dump" | cut -f1)
 log_info "Database backed up ($SIZE)"
 
 # Backup filestore
 log_info "Backing up filestore..."
-docker exec -T "$ODOO_CONTAINER" tar czf - -C /var/lib/odoo . > "$BACKUP_PATH/odoo_filestore.tar.gz" 2>/dev/null || {
+docker exec "$ODOO_CONTAINER" tar czf - -C /var/lib/odoo . > "$BACKUP_PATH/odoo_filestore.tar.gz" 2>/dev/null || {
     log_info "No filestore data (normal)"
     tar czf "$BACKUP_PATH/odoo_filestore.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
 }
