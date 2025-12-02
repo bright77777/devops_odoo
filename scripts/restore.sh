@@ -1,142 +1,104 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+# restore.sh <backup-file-or-key>
+# - si argument est un fichier local, l'utilise
+# - sinon télécharge depuis s3://$CF_R2_BUCKET/<key>
+# - extrait db.sql/db.dump, filestore.tgz, addons.tgz
+# - démarre postgres, attend pg_isready, restaure DB, restaure filestore, restore addons, démarre odoo
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-ENV_FILE="$PROJECT_ROOT/.env"
-BACKUP_DIR="$PROJECT_ROOT/backup"
+ROOT="$(dirname "$SCRIPT_DIR")"
+ENV_FILE="$ROOT/.env"
+[ -f "$ENV_FILE" ] && set -o allexport; source "$ENV_FILE"; set +o allexport
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
-[ $# -eq 0 ] && { log_error "Usage: $0 <backup-name.tar.gz>"; ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null || log_info "No backups found"; exit 1; }
-[ -f "$ENV_FILE" ] || { log_error ".env not found"; exit 1; }
-
-set -a; source "$ENV_FILE"; set +a
-
-BACKUP_NAME="$1"
-BACKUP_FILE="$BACKUP_DIR/$BACKUP_NAME"
-TEMP_DIR=$(mktemp -d)
-trap "rm -rf $TEMP_DIR" EXIT
-
-echo ""
-echo "🔄 RESTORE ODOO"
-echo "════════════════════════════════════════════"
-echo ""
-
-# Get container names - try multiple ways
-POSTGRES_CONTAINER=""
-ODOO_CONTAINER=""
-
-# Method 1: By image name
-POSTGRES_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=postgres:15*" 2>/dev/null | head -1)
-ODOO_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=odoo:*" 2>/dev/null | head -1)
-
-# Method 2: Search by image name pattern
-if [ -z "$POSTGRES_CONTAINER" ]; then
-    POSTGRES_CONTAINER=$(docker ps --format "table {{.Names}}\t{{.Image}}" | grep -i postgres | awk '{print $1}' | head -1)
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <backup-file-or-key>"
+  exit 1
 fi
 
-if [ -z "$ODOO_CONTAINER" ]; then
-    ODOO_CONTAINER=$(docker ps --format "table {{.Names}}\t{{.Image}}" | grep -i "^odoo" | awk '{print $1}' | head -1)
-fi
+BACKUP_KEY="$1"
+TMP="/tmp/odoo_restore_$(date +%s)"
+mkdir -p "$TMP"
 
-# Method 3: Common container names
-if [ -z "$POSTGRES_CONTAINER" ]; then
-    for name in odoo-db odoo-postgres postgres-odoo postgres; do
-        if docker ps --format "{{.Names}}" | grep -q "^${name}$"; then
-            POSTGRES_CONTAINER="$name"
-            break
-        fi
-    done
-fi
+CF_R2_BUCKET="${CF_R2_BUCKET:-}"
+POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
+ODOO_SERVICE="${ODOO_SERVICE:-odoo}"
+ODOO_VOLUME="${ODOO_VOLUME:-odoo-web-data}"
+POSTGRES_USER="${POSTGRES_USER:-odoo}"
+POSTGRES_DB="${POSTGRES_DB:-postgres}"
 
-if [ -z "$ODOO_CONTAINER" ]; then
-    for name in odoo-app odoo-web odoo; do
-        if docker ps --format "{{.Names}}" | grep -q "^${name}$"; then
-            ODOO_CONTAINER="$name"
-            break
-        fi
-    done
-fi
-
-if [ -z "$POSTGRES_CONTAINER" ] || [ -z "$ODOO_CONTAINER" ]; then
-    log_error "Could not find Docker containers"
-    log_error "PostgreSQL: $POSTGRES_CONTAINER"
-    log_error "Odoo: $ODOO_CONTAINER"
+# Téléchargement si nécessaire
+if [ -f "$BACKUP_KEY" ]; then
+  echo "[INFO] Utilisation du backup local: $BACKUP_KEY"
+  cp "$BACKUP_KEY" "$TMP/backup.tgz"
+else
+  if [ -z "$CF_R2_BUCKET" ]; then
+    echo "[ERROR] Backup non local et CF_R2_BUCKET non défini."
     exit 1
+  fi
+  echo "[INFO] Téléchargement depuis R2: s3://$CF_R2_BUCKET/$BACKUP_KEY"
+  aws s3 cp "s3://$CF_R2_BUCKET/$BACKUP_KEY" "$TMP/backup.tgz"
 fi
 
-if [ -z "$POSTGRES_CONTAINER" ] || [ -z "$ODOO_CONTAINER" ]; then
-    log_error "Docker containers not found. Run: docker-compose up -d"
-    exit 1
+echo "[INFO] Extraction..."
+tar xzf "$TMP/backup.tgz" -C "$TMP"
+
+echo "⚠️  WARNING: restore va écraser la base et le filestore. Tape 'yes' pour continuer."
+read -r CONF
+if [ "$CONF" != "yes" ]; then
+  echo "[INFO] Abandonné."
+  exit 0
 fi
 
-# Check/download backup
-if [ ! -f "$BACKUP_FILE" ]; then
-    if [ ! -z "$CF_R2_BUCKET" ] && [ "$CF_R2_BUCKET" != "your-bucket-name" ]; then
-        log_info "Downloading from R2..."
-        aws s3 cp "s3://${CF_R2_BUCKET}/${BACKUP_NAME}" "$BACKUP_FILE" --endpoint-url "$CF_R2_ENDPOINT" || { log_error "Download failed"; exit 1; }
-    else
-        log_error "Backup not found: $BACKUP_FILE"
-        exit 1
-    fi
+# Assurer docker compose up -d postgres
+echo "[INFO] Démarrage du service Postgres ($POSTGRES_SERVICE)"
+docker compose up -d "$POSTGRES_SERVICE"
+
+# attente pg_isready
+echo "[INFO] Attente de Postgres..."
+for i in $(seq 1 60); do
+  if docker compose exec -T "$POSTGRES_SERVICE" pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then
+    echo "[INFO] Postgres prêt."
+    break
+  fi
+  sleep 2
+done
+
+# RESTORE DB
+if [ -f "$TMP/db.sql" ]; then
+  echo "[INFO] Restore depuis db.sql..."
+  CID=$(docker compose ps -q "$POSTGRES_SERVICE")
+  docker cp "$TMP/db.sql" "${CID}":/tmp/db.sql
+  docker compose exec -T "$POSTGRES_SERVICE" bash -c "psql -U $POSTGRES_USER -d $POSTGRES_DB -f /tmp/db.sql"
+elif [ -f "$TMP/db.dump" ]; then
+  echo "[INFO] Restore depuis db.dump (pg_restore)..."
+  CID=$(docker compose ps -q "$POSTGRES_SERVICE")
+  docker cp "$TMP/db.dump" "${CID}":/tmp/db.dump
+  docker compose exec -T "$POSTGRES_SERVICE" bash -c "pg_restore -U $POSTGRES_USER -d $POSTGRES_DB --clean --if-exists /tmp/db.dump"
+else
+  echo "[WARN] Aucun fichier db trouvé dans l'archive."
 fi
 
-SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
-log_info "Using backup: $BACKUP_FILE ($SIZE)"
+# RESTORE filestore -> volume
+if [ -f "$TMP/filestore.tgz" ]; then
+  echo "[INFO] Restoration filestore dans le volume $ODOO_VOLUME..."
+  docker volume inspect "$ODOO_VOLUME" >/dev/null 2>&1 || docker volume create "$ODOO_VOLUME"
+  docker run --rm -v "$ODOO_VOLUME":/data -v "$TMP":/backup busybox \
+    sh -c "rm -rf /data/* && tar xzf /backup/filestore.tgz -C /data"
+else
+  echo "[WARN] filestore.tgz absent."
+fi
 
-# Confirm
-echo ""
-echo "⚠️  WARNING: This will drop and recreate the database!"
-echo ""
-read -p "Continue? (yes/no): " -r CONFIRM
-[[ ! "$CONFIRM" =~ ^[Yy][Ee][Ss]$ ]] && { log_error "Restore cancelled"; exit 1; }
-
-# Extract
-log_info "Extracting backup..."
-tar xzf "$BACKUP_FILE" -C "$TEMP_DIR"
-BACKUP_CONTENT_DIR=$(ls -d "$TEMP_DIR"/odoo_backup_* | head -1)
-DUMP_FILE="$BACKUP_CONTENT_DIR/odoo_db.dump"
-FILESTORE_TAR="$BACKUP_CONTENT_DIR/odoo_filestore.tar.gz"
-
-[ ! -f "$DUMP_FILE" ] && { log_error "Database dump not found in backup"; exit 1; }
-
-# Stop Odoo (keep PostgreSQL running)
-log_info "Stopping Odoo..."
-docker stop "$ODOO_CONTAINER" || true
-sleep 2
-
-# Drop and recreate database
-log_info "Dropping database..."
-docker exec "$POSTGRES_CONTAINER" dropdb -U "${POSTGRES_USER}" "${POSTGRES_DB}" 2>/dev/null || true
-
-log_info "Creating database..."
-docker exec "$POSTGRES_CONTAINER" createdb -U "${POSTGRES_USER}" "${POSTGRES_DB}"
-
-# Restore database
-log_info "Restoring database..."
-docker exec "$POSTGRES_CONTAINER" pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v < "$DUMP_FILE"
-log_info "Database restored ✓"
-
-# Restore filestore
-if [ -f "$FILESTORE_TAR" ]; then
-    log_info "Restoring filestore..."
-    docker exec "$ODOO_CONTAINER" rm -rf /var/lib/odoo/* 2>/dev/null || true
-    tar xzf "$FILESTORE_TAR" -C "$TEMP_DIR/extract"
-    docker cp "$TEMP_DIR/extract/"* "$ODOO_CONTAINER":/var/lib/odoo/ 2>/dev/null || log_info "No filestore data"
+# RESTORE addons
+if [ -f "$TMP/addons.tgz" ]; then
+  echo "[INFO] Restoration addons -> $ROOT/addons"
+  rm -rf "$ROOT/addons" && mkdir -p "$ROOT/addons"
+  tar xzf "$TMP/addons.tgz" -C "$ROOT/addons"
 fi
 
 # Start Odoo
-log_info "Starting Odoo..."
-docker start "$ODOO_CONTAINER"
-sleep 5
+echo "[INFO] Démarrage du service Odoo ($ODOO_SERVICE)"
+docker compose up -d "$ODOO_SERVICE"
 
-echo ""
-log_info "✅ Restore complete!"
-echo ""
+echo "[INFO] Restore terminé. Vérifie : docker compose ps && docker compose logs -f $ODOO_SERVICE"

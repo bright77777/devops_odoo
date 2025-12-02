@@ -1,59 +1,74 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
+# Setup script adapté à ton docker-compose.yml
+# - Installe docker/docker-compose/awscli si manquant
+# - Configure aws cli pour Cloudflare R2 si variables présentes
+# - Pull et demarre les services
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-ENV_FILE="$PROJECT_ROOT/.env"
+ROOT="$(dirname "$SCRIPT_DIR")"
+ENV_FILE="$ROOT/.env"
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
-# Minimal setup: use docker-compose at project root (no extra networks)
-
-if [ ! -f "$ENV_FILE" ]; then
-  log_error ".env not found in $PROJECT_ROOT"
-  log_info "Create it from .env.example and set POSTGRES_USER/PASSWORD/DB"
-  exit 1
-fi
-
-set -a; source "$ENV_FILE"; set +a
-
-echo
-log_info "Starting containers with docker-compose (minimal)"
-cd "$PROJECT_ROOT"
-
-# Prefer 'docker compose' when available
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  DC="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then
-  DC="docker-compose"
+if [ -f "$ENV_FILE" ]; then
+  set -o allexport
+  # shellcheck disable=SC1091
+  source "$ENV_FILE"
+  set +o allexport
 else
-  log_error "Neither 'docker compose' nor 'docker-compose' found. Install Docker Compose first."
-  exit 1
+  echo "[WARN] .env non trouvé dans $ENV_FILE — utiliser les valeurs par défaut si présentes."
 fi
 
-# Pull images if possible (quiet), then start
-$DC pull 2>/dev/null || true
-$DC up -d
+echo "[INFO] Vérification des binaires docker / docker compose / aws..."
+if ! command -v docker >/dev/null 2>&1; then
+  sudo apt update
+  sudo apt install -y docker.io
+fi
 
-# Wait for postgres health (container name: odoo-db)
-log_info "Waiting for PostgreSQL (odoo-db) to become healthy..."
-for i in $(seq 1 30); do
-  if docker ps --format '{{.Names}}' | grep -q '^odoo-db$'; then
-    HEALTH=$(docker inspect --format '{{.State.Health.Status}}' odoo-db 2>/dev/null || true)
-    if [ "$HEALTH" = "healthy" ]; then
-      log_info "PostgreSQL healthy"
-      break
-    fi
+# docker compose peut être disponible via plugin (docker compose) ou binaire
+if ! docker compose version >/dev/null 2>&1; then
+  sudo apt install -y docker-compose-plugin || true
+fi
+
+if ! command -v aws >/dev/null 2>&1; then
+  sudo snap install aws-cli --classic || true
+fi
+
+# Configure AWS CLI for Cloudflare R2 (si variables présentes)
+if [ -n "${CF_R2_ACCESS_KEY_ID:-}" ] && [ -n "${CF_R2_SECRET_ACCESS_KEY:-}" ] && [ -n "${CF_R2_ENDPOINT:-}" ]; then
+  mkdir -p "$HOME/.aws"
+  cat > "$HOME/.aws/credentials" <<EOF
+[default]
+aws_access_key_id = ${CF_R2_ACCESS_KEY_ID}
+aws_secret_access_key = ${CF_R2_SECRET_ACCESS_KEY}
+EOF
+  cat > "$HOME/.aws/config" <<EOF
+[default]
+region = auto
+s3 =
+  endpoint_url = ${CF_R2_ENDPOINT}
+EOF
+  echo "[INFO] AWS CLI configuré pour Cloudflare R2."
+fi
+
+# Pull et démarrage
+echo "[INFO] docker compose pull"
+docker compose pull
+
+echo "[INFO] docker compose up -d"
+docker compose up -d
+
+# Wait for Postgres to be ready
+POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
+POSTGRES_USER="${POSTGRES_USER:-odoo}"
+
+echo "[INFO] Attente de Postgres ($POSTGRES_SERVICE) ..."
+for i in $(seq 1 60); do
+  if docker compose exec -T "$POSTGRES_SERVICE" pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then
+    echo "[INFO] Postgres est prêt."
+    break
   fi
   sleep 2
 done
 
-log_info "Setup finished. Verify with: docker ps && docker-compose ps"
-
-exit 0
+echo "[INFO] Setup terminé. Consulte : docker compose ps && docker compose logs -f ${POSTGRES_SERVICE}"

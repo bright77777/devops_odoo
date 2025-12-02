@@ -1,133 +1,55 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+# backup.sh
+# - dump DB (pg_dump -F c) dans /tmp
+# - archive filestore (volume odoo-web-data)
+# - archive addons (./addons)
+# - pack en tar.gz et upload sur R2 (aws s3)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-ENV_FILE="$PROJECT_ROOT/.env"
-BACKUP_DIR="$PROJECT_ROOT/backup"
+ROOT="$(dirname "$SCRIPT_DIR")"
+ENV_FILE="$ROOT/.env"
+set -o allexport; [ -f "$ENV_FILE" ] && source "$ENV_FILE"; set +o allexport
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m'
+TIMESTAMP=$(date +%F_%H-%M-%S)
+TMP="/tmp/odoo_backup_$TIMESTAMP"
+mkdir -p "$TMP"
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
+POSTGRES_USER="${POSTGRES_USER:-odoo}"
+POSTGRES_DB="${POSTGRES_DB:-postgres}"
+ODOO_VOLUME="${ODOO_VOLUME:-odoo-web-data}"
+CF_R2_BUCKET="${CF_R2_BUCKET:-}"
 
-[ -f "$ENV_FILE" ] || { log_error ".env not found"; exit 1; }
-set -a; source "$ENV_FILE"; set +a
-
-mkdir -p "$BACKUP_DIR"
-TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-BACKUP_NAME="odoo_backup_${TIMESTAMP}"
-BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
-mkdir -p "$BACKUP_PATH"
-
-echo ""
-echo "🔄 BACKUP ODOO"
-echo "════════════════════════════════════════════"
-echo ""
-
-# Get container names - try multiple ways
-POSTGRES_CONTAINER=""
-ODOO_CONTAINER=""
-
-# Method 1: By image name
-POSTGRES_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=postgres:15*" 2>/dev/null | head -1)
-ODOO_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=odoo:*" 2>/dev/null | head -1)
-
-# Method 2: Search by image name pattern in all containers
-if [ -z "$POSTGRES_CONTAINER" ]; then
-    POSTGRES_CONTAINER=$(docker ps --format "table {{.Names}}\t{{.Image}}" | grep -i postgres | awk '{print $1}' | head -1)
+echo "[1/4] Dump de la base PostgreSQL (service: $POSTGRES_SERVICE)..."
+CONTAINER_ID=$(docker compose ps -q "$POSTGRES_SERVICE")
+if [ -n "$CONTAINER_ID" ]; then
+  docker exec -t "$CONTAINER_ID" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F c -f /tmp/db.dump || \
+    docker exec -t "$CONTAINER_ID" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$TMP/db.sql"
+  docker cp "$CONTAINER_ID":/tmp/db.dump "$TMP/" 2>/dev/null || true
 fi
 
-if [ -z "$ODOO_CONTAINER" ]; then
-    ODOO_CONTAINER=$(docker ps --format "table {{.Names}}\t{{.Image}}" | grep -i "^odoo" | awk '{print $1}' | head -1)
+echo "[2/4] Archive filestore (volume: $ODOO_VOLUME)..."
+docker run --rm -v "$ODOO_VOLUME":/data -v "$TMP":/backup busybox \
+  sh -c "tar czf /backup/filestore.tgz -C /data ."
+
+echo "[3/4] Archive addons (si ./addons existe)..."
+if [ -d "$ROOT/addons" ]; then
+  tar czf "$TMP/addons.tgz" -C "$ROOT" "addons"
 fi
 
-# Method 3: Common container names
-if [ -z "$POSTGRES_CONTAINER" ]; then
-    for name in odoo-db odoo-postgres postgres-odoo postgres; do
-        if docker ps --format "{{.Names}}" | grep -q "^${name}$"; then
-            POSTGRES_CONTAINER="$name"
-            break
-        fi
-    done
-fi
+echo "[4/4] Création du bundle backup..."
+cp -n "$ROOT/docker-compose.yml" "$TMP/" 2>/dev/null || true
+[ -f "$ROOT/.env" ] && cp -n "$ROOT/.env" "$TMP/env_snapshot" || true
+tar czf /tmp/odoo_backup_${TIMESTAMP}.tar.gz -C "$TMP" .
 
-if [ -z "$ODOO_CONTAINER" ]; then
-    for name in odoo-app odoo-web odoo; do
-        if docker ps --format "{{.Names}}" | grep -q "^${name}$"; then
-            ODOO_CONTAINER="$name"
-            break
-        fi
-    done
-fi
-
-if [ -z "$POSTGRES_CONTAINER" ] || [ -z "$ODOO_CONTAINER" ]; then
-    log_error "Could not find Docker containers"
-    log_error "PostgreSQL: $POSTGRES_CONTAINER"
-    log_error "Odoo: $ODOO_CONTAINER"
-    log_error ""
-    log_error "Available containers:"
-    docker ps --format "table {{.Names}}\t{{.Image}}"
-    exit 1
-fi
-
-log_info "Found containers: PostgreSQL=$POSTGRES_CONTAINER, Odoo=$ODOO_CONTAINER"
-
-# Backup PostgreSQL
-log_info "Backing up database..."
-docker exec "$POSTGRES_CONTAINER" pg_dump -U "${POSTGRES_USER}" -F c "${POSTGRES_DB}" > "$BACKUP_PATH/odoo_db.dump"
-SIZE=$(du -h "$BACKUP_PATH/odoo_db.dump" | cut -f1)
-log_info "Database backed up ($SIZE)"
-
-# Backup filestore
-log_info "Backing up filestore..."
-docker exec "$ODOO_CONTAINER" tar czf - -C /var/lib/odoo . > "$BACKUP_PATH/odoo_filestore.tar.gz" 2>/dev/null || {
-    log_info "No filestore data (normal)"
-    tar czf "$BACKUP_PATH/odoo_filestore.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
-}
-
-# Backup addons
-log_info "Backing up addons..."
-if [ -d "$PROJECT_ROOT/addons" ]; then
-    tar czf "$BACKUP_PATH/odoo_addons.tar.gz" -C "$PROJECT_ROOT" addons
+if [ -n "$CF_R2_BUCKET" ]; then
+  echo "[INFO] Upload vers Cloudflare R2 (bucket: $CF_R2_BUCKET)..."
+  aws s3 cp /tmp/odoo_backup_${TIMESTAMP}.tar.gz s3://$CF_R2_BUCKET/ || echo "[WARN] Upload échoué"
+  echo "[INFO] Upload terminé : s3://$CF_R2_BUCKET/odoo_backup_${TIMESTAMP}.tar.gz"
 else
-    tar czf "$BACKUP_PATH/odoo_addons.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
+  echo "[INFO] CF_R2_BUCKET non défini — backup local sauvegardé : /tmp/odoo_backup_${TIMESTAMP}.tar.gz"
 fi
 
-# Create metadata
-cat > "$BACKUP_PATH/backup.info" <<EOF
-BACKUP_NAME=$BACKUP_NAME
-TIMESTAMP=$TIMESTAMP
-DATE=$(date)
-DATABASE=odoo_db.dump
-FILESTORE=odoo_filestore.tar.gz
-ADDONS=odoo_addons.tar.gz
-EOF
-
-# Compress
-log_info "Compressing backup..."
-BACKUP_ARCHIVE="$BACKUP_DIR/${BACKUP_NAME}.tar.gz"
-tar czf "$BACKUP_ARCHIVE" -C "$BACKUP_DIR" "$BACKUP_NAME"
-rm -rf "$BACKUP_PATH"
-
-ARCHIVE_SIZE=$(du -h "$BACKUP_ARCHIVE" | cut -f1)
-log_info "Backup compressed ($ARCHIVE_SIZE)"
-
-# Upload to R2
-if [ ! -z "$CF_R2_BUCKET" ] && [ "$CF_R2_BUCKET" != "your-bucket-name" ]; then
-    log_info "Uploading to Cloudflare R2..."
-    if aws s3 cp "$BACKUP_ARCHIVE" "s3://${CF_R2_BUCKET}/${BACKUP_NAME}.tar.gz" --endpoint-url "$CF_R2_ENDPOINT" 2>&1; then
-        log_info "Uploaded to R2 ✓"
-    else
-        log_error "R2 upload failed (backup still local)"
-    fi
-else
-    log_info "R2 not configured, backup kept locally"
-fi
-
-echo ""
-log_info "✅ Backup complete: $BACKUP_ARCHIVE"
-echo ""
+echo "DONE"
