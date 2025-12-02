@@ -46,6 +46,7 @@ fi
 # Configure AWS for R2
 log_info "Configuring AWS CLI..."
 mkdir -p ~/.aws
+
 cat > ~/.aws/credentials <<EOF
 [default]
 aws_access_key_id = ${CF_R2_ACCESS_KEY_ID}
@@ -53,13 +54,13 @@ aws_secret_access_key = ${CF_R2_SECRET_ACCESS_KEY}
 EOF
 chmod 600 ~/.aws/credentials
 
-if [ ! -f ~/.aws/config ]; then
-    cat > ~/.aws/config <<EOF
+cat > ~/.aws/config <<EOF
 [default]
+region = auto
 s3 =
-  endpoint_url = ${CF_R2_ENDPOINT}
+    endpoint_url = ${CF_R2_ENDPOINT}
 EOF
-fi
+chmod 644 ~/.aws/config
 
 # Create backup dir
 mkdir -p "$PROJECT_ROOT/backup"
