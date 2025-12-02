@@ -70,9 +70,19 @@ cd "$PROJECT_ROOT"
 docker-compose pull 2>/dev/null
 docker-compose up -d
 
-# Wait for PostgreSQL
+# Wait for PostgreSQL - get container name
+POSTGRES_CONTAINER=$(docker ps --format "table {{.Names}}\t{{.Image}}" | grep -i postgres | awk '{print $1}' | head -1)
+if [ -z "$POSTGRES_CONTAINER" ]; then
+    for name in odoo-db odoo-postgres postgres; do
+        if docker ps --format "{{.Names}}" | grep -q "^${name}$"; then
+            POSTGRES_CONTAINER="$name"
+            break
+        fi
+    done
+fi
+
 for i in {1..30}; do
-    if docker exec $(docker ps -q -f "ancestor=postgres:*") pg_isready -U "${POSTGRES_USER}" &>/dev/null; then
+    if [ ! -z "$POSTGRES_CONTAINER" ] && docker exec "$POSTGRES_CONTAINER" pg_isready -U "${POSTGRES_USER}" &>/dev/null; then
         log_info "PostgreSQL ready ✓"
         break
     fi

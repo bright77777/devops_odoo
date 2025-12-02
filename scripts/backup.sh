@@ -28,14 +28,53 @@ echo "🔄 BACKUP ODOO"
 echo "════════════════════════════════════════════"
 echo ""
 
-# Get container names
-POSTGRES_CONTAINER=$(docker ps -q -f "ancestor=postgres:*" | head -1)
-ODOO_CONTAINER=$(docker ps -q -f "ancestor=odoo:*" | head -1)
+# Get container names - try multiple ways
+POSTGRES_CONTAINER=""
+ODOO_CONTAINER=""
+
+# Method 1: By image name
+POSTGRES_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=postgres:15*" 2>/dev/null | head -1)
+ODOO_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=odoo:*" 2>/dev/null | head -1)
+
+# Method 2: Search by image name pattern in all containers
+if [ -z "$POSTGRES_CONTAINER" ]; then
+    POSTGRES_CONTAINER=$(docker ps --format "table {{.Names}}\t{{.Image}}" | grep -i postgres | awk '{print $1}' | head -1)
+fi
+
+if [ -z "$ODOO_CONTAINER" ]; then
+    ODOO_CONTAINER=$(docker ps --format "table {{.Names}}\t{{.Image}}" | grep -i "^odoo" | awk '{print $1}' | head -1)
+fi
+
+# Method 3: Common container names
+if [ -z "$POSTGRES_CONTAINER" ]; then
+    for name in odoo-db odoo-postgres postgres-odoo postgres; do
+        if docker ps --format "{{.Names}}" | grep -q "^${name}$"; then
+            POSTGRES_CONTAINER="$name"
+            break
+        fi
+    done
+fi
+
+if [ -z "$ODOO_CONTAINER" ]; then
+    for name in odoo-app odoo-web odoo; do
+        if docker ps --format "{{.Names}}" | grep -q "^${name}$"; then
+            ODOO_CONTAINER="$name"
+            break
+        fi
+    done
+fi
 
 if [ -z "$POSTGRES_CONTAINER" ] || [ -z "$ODOO_CONTAINER" ]; then
-    log_error "Docker containers not found. Run: docker-compose up -d"
+    log_error "Could not find Docker containers"
+    log_error "PostgreSQL: $POSTGRES_CONTAINER"
+    log_error "Odoo: $ODOO_CONTAINER"
+    log_error ""
+    log_error "Available containers:"
+    docker ps --format "table {{.Names}}\t{{.Image}}"
     exit 1
 fi
+
+log_info "Found containers: PostgreSQL=$POSTGRES_CONTAINER, Odoo=$ODOO_CONTAINER"
 
 # Backup PostgreSQL
 log_info "Backing up database..."
