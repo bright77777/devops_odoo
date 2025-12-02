@@ -27,7 +27,7 @@ fi
 
 # docker compose peut être disponible via plugin (docker compose) ou binaire
 if ! docker compose version >/dev/null 2>&1; then
-  sudo apt install -y docker-compose-plugin || true
+  sudo apt install -y docker-compose || true
 fi
 
 if ! command -v aws >/dev/null 2>&1; then
