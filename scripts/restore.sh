@@ -81,7 +81,7 @@ fi
 if [ ! -f "$BACKUP_FILE" ]; then
     if [ ! -z "$CF_R2_BUCKET" ] && [ "$CF_R2_BUCKET" != "your-bucket-name" ]; then
         log_info "Downloading from R2..."
-        aws s3 cp "s3://${CF_R2_BUCKET}/${BACKUP_NAME}" "$BACKUP_FILE" --region auto || { log_error "Download failed"; exit 1; }
+        aws s3 cp "s3://${CF_R2_BUCKET}/${BACKUP_NAME}" "$BACKUP_FILE" --endpoint-url "$CF_R2_ENDPOINT" || { log_error "Download failed"; exit 1; }
     else
         log_error "Backup not found: $BACKUP_FILE"
         exit 1
