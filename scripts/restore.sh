@@ -133,19 +133,60 @@ if [ ! -f "$BACKUP_PATH/odoo_db.dump" ]; then
 fi
 
 # Find containers
-POSTGRES_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=postgres:15" 2>/dev/null | head -1)
-ODOO_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=odoo:19.0" 2>/dev/null | head -1)
+POSTGRES_CONTAINER=""
+ODOO_CONTAINER=""
 
+# try common names first
+for n in odoo-db postgres db; do
+  if docker ps --format '{{.Names}}' | grep -qx "$n"; then
+    POSTGRES_CONTAINER="$n"
+    break
+  fi
+done
+
+# try by image name if not found
 if [ -z "$POSTGRES_CONTAINER" ]; then
-    POSTGRES_CONTAINER="odoo-db"
+  POSTGRES_CONTAINER=$(docker ps --format '{{.Names}} {{.Image}}' | awk '/postgres/ {print $1; exit}')
 fi
+
+# fallback: pick first container whose image name starts with postgres
+if [ -z "$POSTGRES_CONTAINER" ]; then
+  POSTGRES_CONTAINER=$(docker ps --filter "ancestor=postgres" --format '{{.Names}}' | head -n1)
+fi
+
+# Odoo container: common names
+for n in odoo odoo-app odoo-server odoo-odoo; do
+  if docker ps --format '{{.Names}}' | grep -qx "$n"; then
+    ODOO_CONTAINER="$n"
+    break
+  fi
+done
+
+# try by image name if not found
 if [ -z "$ODOO_CONTAINER" ]; then
-    ODOO_CONTAINER="odoo-app"
+  ODOO_CONTAINER=$(docker ps --format '{{.Names}} {{.Image}}' | awk '/odoo/ {print $1; exit}')
 fi
+
+# final sanity: if still empty, show helpful message and candidates
+if [ -z "$POSTGRES_CONTAINER" ] || [ -z "$ODOO_CONTAINER" ]; then
+  echo ""
+  log_error "Impossible de détecter automatiquement les conteneurs PostgreSQL et/ou Odoo."
+  echo ""
+  echo "Conteneurs en cours d'exécution (docker ps):"
+  docker ps --format '  {{.ID}}  {{.Names}}  {{.Image}}' || true
+  echo ""
+  echo "Suggestions:"
+  echo "  - Passe l'ID/nom du conteneur en variable d'environnement avant d'appeler restore:"
+  echo "      POSTGRES_CONTAINER=352dcac81ab7 ./restore.sh <backup>"
+  echo "  - Ou modifie le script pour définir POSTGRES_CONTAINER et ODOO_CONTAINER manuellement."
+  rm -rf "$TEMP_DIR"
+  exit 1
+fi
+
 
 if ! docker ps --format "{{.Names}}" | grep -q "^${POSTGRES_CONTAINER}$"; then
     log_error "Container $POSTGRES_CONTAINER not running"
-    log_error "Start with: docker compose up -d"
+    log_error "Start with: docker-compose up -d"
     rm -rf "$TEMP_DIR"
     exit 1
 fi
