@@ -202,6 +202,12 @@ else
     fi
 fi
 
+# Start Odoo before restoring filestore
+log_step "Starting Odoo..."
+docker start "$ODOO_CONTAINER" >/dev/null 2>&1
+sleep 3
+log_info "Odoo started ✓"
+
 # Restore filestore
 log_step "Restoring filestore..."
 if [ -f "$BACKUP_PATH/odoo_filestore.tar.gz" ]; then
@@ -216,16 +222,20 @@ if [ -f "$BACKUP_PATH/odoo_addons.tar.gz" ]; then
     log_info "Addons restored ✓"
 fi
 
-# Start Odoo
-log_step "Starting Odoo..."
-docker start "$ODOO_CONTAINER"
+# Restart Odoo to apply changes
+log_step "Restarting Odoo to apply changes..."
+docker restart "$ODOO_CONTAINER" >/dev/null 2>&1
 
 # Wait for Odoo
-log_step "Waiting for Odoo..."
+log_step "Waiting for Odoo to be ready..."
 for i in {1..60}; do
     if curl -s http://localhost:8069/web >/dev/null 2>&1; then
         log_info "Odoo ready ✓"
         break
+    fi
+    if [ $i -eq 60 ]; then
+        log_error "Odoo failed to start (timeout)"
+        log_error "Check logs with: docker logs odoo-app"
     fi
     sleep 2
 done
