@@ -23,10 +23,10 @@ echo ""
 # Check prerequisites
 log_step "Checking prerequisites..."
 command -v docker >/dev/null 2>&1 || { log_error "Docker not installed"; exit 1; }
-command -v docker compose >/dev/null 2>&1 || { log_error "Docker Compose not installed"; exit 1; }
-log_info "Docker: $(docker --version)"
-log_info "Docker Compose: $(docker compose version)"
 
+command -v docker-compose >/dev/null 2>&1 || { log_error "docker-compose not installed"; exit 1; }
+log_info "Docker: $(docker --version)"
+log_info "Docker-Compose: $(docker-compose --version)"
 # Create .env if not exists
 if [ ! -f "$PROJECT_ROOT/.env" ]; then
     log_step "Creating .env file from template..."
@@ -100,14 +100,14 @@ fi
 if docker ps -a --format '{{.Names}}' | grep -q "odoo"; then
     log_step "Stopping existing containers..."
     cd "$PROJECT_ROOT"
-    docker compose down
+    docker-compose down
     log_info "Containers stopped"
 fi
 
 # Start services
 log_step "Starting Odoo infrastructure..."
 cd "$PROJECT_ROOT"
-docker compose up -d
+docker-compose up -d
 
 # Wait for services
 log_step "Waiting for services to be ready..."
