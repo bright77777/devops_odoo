@@ -23,7 +23,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-        restart: unless-stopped
+    restart: unless-stopped    # <-- Corrigé: même niveau que depends_on
     ports:
       - "8069:8069"
     environment:
@@ -32,9 +32,8 @@ services:
       - PASSWORD=odoo
       - DB_NAME=postgres
     volumes:
-      - odoo-web-data:/var/lib/odoo        # filestore & sessions
-      - ./addons:/mnt/extra-addons         # optional : modules locaux
-    # if you want to provide a config file, mount ./config:/etc/odoo and add command: odoo -c /etc/odoo/odoo.conf
+      - odoo-web-data:/var/lib/odoo
+      - ./addons:/mnt/extra-addons
 
 volumes:
   odoo-db-data:
