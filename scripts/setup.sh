@@ -44,7 +44,7 @@ aws_secret_access_key = ${CF_R2_SECRET_ACCESS_KEY}
 EOF
   cat > "$HOME/.aws/config" <<EOF
 [default]
-region = auto
+region = autoJ
 s3 =
   endpoint_url = ${CF_R2_ENDPOINT}
 EOF
