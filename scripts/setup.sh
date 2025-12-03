@@ -1,74 +1,149 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-# Setup script adapté à ton docker-compose.yml
-# - Installe docker/docker-compose/awscli si manquant
-# - Configure aws cli pour Cloudflare R2 si variables présentes
-# - Pull et demarre les services
+set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$SCRIPT_DIR")"
-ENV_FILE="$ROOT/.env"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-if [ -f "$ENV_FILE" ]; then
-  set -o allexport
-  # shellcheck disable=SC1091
-  source "$ENV_FILE"
-  set +o allexport
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+clear
+echo ""
+echo "🚀 ODOO INFRASTRUCTURE SETUP"
+echo "════════════════════════════════════════════"
+echo ""
+
+# Check prerequisites
+log_step "Checking prerequisites..."
+command -v docker >/dev/null 2>&1 || { log_error "Docker not installed"; exit 1; }
+command -v docker compose >/dev/null 2>&1 || { log_error "Docker Compose not installed"; exit 1; }
+log_info "Docker: $(docker --version)"
+log_info "Docker Compose: $(docker compose version)"
+
+# Create .env if not exists
+if [ ! -f "$PROJECT_ROOT/.env" ]; then
+    log_step "Creating .env file from template..."
+    if [ -f "$PROJECT_ROOT/.env.example" ]; then
+        cp "$PROJECT_ROOT/.env.example" "$PROJECT_ROOT/.env"
+        log_info ".env created - PLEASE CONFIGURE IT BEFORE CONTINUING!"
+        echo ""
+        echo "Edit .env and set:"
+        echo "  - POSTGRES_PASSWORD"
+        echo "  - ODOO_ADMIN_PASSWORD"
+        echo "  - CF_R2_* credentials (if using R2)"
+        echo ""
+        exit 0
+    else
+        log_error ".env.example not found"
+        exit 1
+    fi
+fi
+
+# Load environment
+set -a
+source "$PROJECT_ROOT/.env"
+set +a
+
+# Create directories
+log_step "Creating directory structure..."
+mkdir -p "$PROJECT_ROOT/addons"
+mkdir -p "$PROJECT_ROOT/config"
+mkdir -p "$PROJECT_ROOT/backup"
+log_info "Directories created"
+
+# Create odoo.conf if not exists
+if [ ! -f "$PROJECT_ROOT/config/odoo.conf" ]; then
+    log_step "Creating default Odoo configuration..."
+    cat > "$PROJECT_ROOT/config/odoo.conf" <<EOF
+[options]
+addons_path = /mnt/extra-addons
+data_dir = /var/lib/odoo
+admin_passwd = ${ODOO_ADMIN_PASSWORD:-admin}
+db_host = db
+db_port = 5432
+db_user = ${POSTGRES_USER:-odoo}
+db_password = ${POSTGRES_PASSWORD:-odoo}
+workers = ${ODOO_WORKERS:-4}
+max_cron_threads = 2
+limit_time_cpu = ${ODOO_TIMEOUT:-600}
+limit_time_real = ${ODOO_TIMEOUT:-600}
+limit_memory_soft = 2147483648
+limit_memory_hard = 2684354560
+log_level = info
+EOF
+    log_info "odoo.conf created"
+fi
+
+# Check R2 configuration
+if [ -z "$CF_R2_ENDPOINT" ] || [ -z "$CF_R2_BUCKET" ] || [ -z "$CF_R2_ACCESS_KEY_ID" ] || [ -z "$CF_R2_SECRET_ACCESS_KEY" ]; then
+    log_info "⚠️  R2 not configured - backups will be local only"
 else
-  echo "[WARN] .env non trouvé dans $ENV_FILE — utiliser les valeurs par défaut si présentes."
+    log_step "Testing R2 connection..."
+    if AWS_ACCESS_KEY_ID="$CF_R2_ACCESS_KEY_ID" \
+       AWS_SECRET_ACCESS_KEY="$CF_R2_SECRET_ACCESS_KEY" \
+       aws s3 ls "s3://${CF_R2_BUCKET}" --endpoint-url "$CF_R2_ENDPOINT" >/dev/null 2>&1; then
+        log_info "R2 connection successful ✓"
+    else
+        log_error "R2 connection failed - check credentials"
+        echo "Continuing without R2..."
+    fi
 fi
 
-echo "[INFO] Vérification des binaires docker / docker compose / aws..."
-if ! command -v docker >/dev/null 2>&1; then
-  sudo apt update
-  sudo apt install -y docker.io
+# Stop existing containers
+if docker ps -a --format '{{.Names}}' | grep -q "odoo"; then
+    log_step "Stopping existing containers..."
+    cd "$PROJECT_ROOT"
+    docker compose down
+    log_info "Containers stopped"
 fi
 
-# docker compose peut être disponible via plugin (docker compose) ou binaire
-if ! docker compose version >/dev/null 2>&1; then
-  sudo apt install -y docker-compose || true
-fi
-
-if ! command -v aws >/dev/null 2>&1; then
-  sudo snap install aws-cli --classic || true
-fi
-
-# Configure AWS CLI for Cloudflare R2 (si variables présentes)
-if [ -n "${CF_R2_ACCESS_KEY_ID:-}" ] && [ -n "${CF_R2_SECRET_ACCESS_KEY:-}" ] && [ -n "${CF_R2_ENDPOINT:-}" ]; then
-  mkdir -p "$HOME/.aws"
-  cat > "$HOME/.aws/credentials" <<EOF
-[default]
-aws_access_key_id = ${CF_R2_ACCESS_KEY_ID}
-aws_secret_access_key = ${CF_R2_SECRET_ACCESS_KEY}
-EOF
-  cat > "$HOME/.aws/config" <<EOF
-[default]
-region = autoJ
-s3 =
-  endpoint_url = ${CF_R2_ENDPOINT}
-EOF
-  echo "[INFO] AWS CLI configuré pour Cloudflare R2."
-fi
-
-# Pull et démarrage
-echo "[INFO] docker compose pull"
-docker compose pull
-
-echo "[INFO] docker compose up -d"
+# Start services
+log_step "Starting Odoo infrastructure..."
+cd "$PROJECT_ROOT"
 docker compose up -d
 
-# Wait for Postgres to be ready
-POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
-POSTGRES_USER="${POSTGRES_USER:-odoo}"
-
-echo "[INFO] Attente de Postgres ($POSTGRES_SERVICE) ..."
-for i in $(seq 1 60); do
-  if docker compose exec -T "$POSTGRES_SERVICE" pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then
-    echo "[INFO] Postgres est prêt."
-    break
-  fi
-  sleep 2
+# Wait for services
+log_step "Waiting for services to be ready..."
+for i in {1..30}; do
+    if docker exec odoo-db pg_isready -U "${POSTGRES_USER:-odoo}" >/dev/null 2>&1; then
+        log_info "PostgreSQL ready ✓"
+        break
+    fi
+    sleep 2
 done
 
-echo "[INFO] Setup terminé. Consulte : docker compose ps && docker compose logs -f ${POSTGRES_SERVICE}"
+for i in {1..60}; do
+    if curl -s http://localhost:8069/web/database/selector >/dev/null 2>&1; then
+        log_info "Odoo ready ✓"
+        break
+    fi
+    sleep 2
+done
+
+# Make scripts executable
+chmod +x "$SCRIPT_DIR/backup.sh"
+chmod +x "$SCRIPT_DIR/restore.sh"
+
+echo ""
+echo "════════════════════════════════════════════"
+echo "✅ SETUP COMPLETE"
+echo "════════════════════════════════════════════"
+echo ""
+echo "Odoo is running at: http://localhost:8069"
+echo ""
+echo "Available commands:"
+echo "  ./scripts/backup.sh   - Create backup"
+echo "  ./scripts/restore.sh  - Restore from backup"
+echo ""
+echo "Database info:"
+echo "  Host: localhost:5432"
+echo "  User: ${POSTGRES_USER:-odoo}"
+echo "  Database: ${POSTGRES_DB:-odoo}"
+echo ""

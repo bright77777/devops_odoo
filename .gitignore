@@ -1,25 +1,29 @@
 # Environment variables
 .env
+.env.local
+.env.*.local
 
-
-# Backups and dumps
+# Backups
 backup/
+*.tar.gz
 *.dump
 *.sql
-*.sql.gz
-*.tgz
-*.tar.gz
 
-# Docker volumes (local data)
-postgres_data/
-odoo_data/
+# Odoo
+addons/*
+!addons/.gitkeep
+config/odoo.conf
+
+# Docker
+docker-compose.override.yml
 
 # Logs
 *.log
-/var/log/
+logs/
 
 # OS
 .DS_Store
+Thumbs.db
 *.swp
 *.swo
 *~
@@ -27,5 +31,9 @@ odoo_data/
 # IDE
 .vscode/
 .idea/
-*.sublime-project
-*.sublime-workspace
+*.sublime-*
+
+# Temporary files
+tmp/
+temp/
+.cache/
