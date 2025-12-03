@@ -6,18 +6,16 @@ services:
     container_name: odoo-db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-odoo}
-      POSTGRES_USER: ${POSTGRES_USER:-odoo}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-odoo}
+      POSTGRES_DB: postgres
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo        # change en prod
     volumes:
       - odoo-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-odoo}"]
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - odoo-network
 
   odoo:
     image: odoo:19.0
@@ -25,26 +23,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    restart: unless-stopped
+        restart: unless-stopped
     ports:
       - "8069:8069"
     environment:
       - HOST=db
-      - USER=${POSTGRES_USER:-odoo}
-      - PASSWORD=${POSTGRES_PASSWORD:-odoo}
+      - USER=odoo
+      - PASSWORD=odoo
+      - DB_NAME=postgres
     volumes:
-      - odoo-web-data:/var/lib/odoo
-      - ./addons:/mnt/extra-addons
-    networks:
-      - odoo-network
+      - odoo-web-data:/var/lib/odoo        # filestore & sessions
+      - ./addons:/mnt/extra-addons         # optional : modules locaux
+    # if you want to provide a config file, mount ./config:/etc/odoo and add command: odoo -c /etc/odoo/odoo.conf
 
 volumes:
   odoo-db-data:
-    name: odoo-db-data
   odoo-web-data:
-    name: odoo-web-data
-
-networks:
-  odoo-network:
-    name: odoo-network
-    driver: bridge
