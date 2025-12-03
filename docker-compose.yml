@@ -9,7 +9,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-odoo}
       POSTGRES_USER: ${POSTGRES_USER:-odoo}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-odoo}
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
     volumes:
       - odoo-db-data:/var/lib/postgresql/data
     healthcheck:
@@ -31,20 +30,11 @@ services:
       - "8069:8069"
     environment:
       - HOST=db
-      - PORT=5432
       - USER=${POSTGRES_USER:-odoo}
       - PASSWORD=${POSTGRES_PASSWORD:-odoo}
     volumes:
       - odoo-web-data:/var/lib/odoo
       - ./addons:/mnt/extra-addons
-      - ./config:/etc/odoo
-    command: ["odoo", "-c", "/etc/odoo/odoo.conf"]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8069/web/database/selector || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
     networks:
       - odoo-network
 

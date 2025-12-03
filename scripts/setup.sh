@@ -23,10 +23,10 @@ echo ""
 # Check prerequisites
 log_step "Checking prerequisites..."
 command -v docker >/dev/null 2>&1 || { log_error "Docker not installed"; exit 1; }
-
 command -v docker-compose >/dev/null 2>&1 || { log_error "docker-compose not installed"; exit 1; }
 log_info "Docker: $(docker --version)"
-log_info "Docker-Compose: $(docker-compose --version)"
+log_info "docker-compose: $(docker-compose version)"
+
 # Create .env if not exists
 if [ ! -f "$PROJECT_ROOT/.env" ]; then
     log_step "Creating .env file from template..."
@@ -54,32 +54,8 @@ set +a
 # Create directories
 log_step "Creating directory structure..."
 mkdir -p "$PROJECT_ROOT/addons"
-mkdir -p "$PROJECT_ROOT/config"
 mkdir -p "$PROJECT_ROOT/backup"
 log_info "Directories created"
-
-# Create odoo.conf if not exists
-if [ ! -f "$PROJECT_ROOT/config/odoo.conf" ]; then
-    log_step "Creating default Odoo configuration..."
-    cat > "$PROJECT_ROOT/config/odoo.conf" <<EOF
-[options]
-addons_path = /mnt/extra-addons
-data_dir = /var/lib/odoo
-admin_passwd = ${ODOO_ADMIN_PASSWORD:-admin}
-db_host = db
-db_port = 5432
-db_user = ${POSTGRES_USER:-odoo}
-db_password = ${POSTGRES_PASSWORD:-odoo}
-workers = ${ODOO_WORKERS:-4}
-max_cron_threads = 2
-limit_time_cpu = ${ODOO_TIMEOUT:-600}
-limit_time_real = ${ODOO_TIMEOUT:-600}
-limit_memory_soft = 2147483648
-limit_memory_hard = 2684354560
-log_level = info
-EOF
-    log_info "odoo.conf created"
-fi
 
 # Check R2 configuration
 if [ -z "$CF_R2_ENDPOINT" ] || [ -z "$CF_R2_BUCKET" ] || [ -z "$CF_R2_ACCESS_KEY_ID" ] || [ -z "$CF_R2_SECRET_ACCESS_KEY" ]; then
