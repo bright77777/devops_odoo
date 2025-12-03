@@ -197,9 +197,28 @@ docker stop "$ODOO_CONTAINER" >/dev/null 2>&1 || true
 
 # Drop and recreate database
 log_step "Recreating database..."
-docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
-docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};" >/dev/null 2>&1 || true
-docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER};" >/dev/null 2>&1
+
+# try to terminate active connections (non-fatal)
+if ! docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();"; then
+    log_warn "Could not terminate backend connections (continuing)..."
+fi
+
+# drop DB (non-fatal)
+if ! docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};"; then
+    log_warn "DROP DATABASE failed (continuing)..."
+fi
+
+# create DB (fatal if fails) — show output on error
+if ! docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER};"; then
+    log_error "Failed to create database ${POSTGRES_DB}. Voir les logs PostgreSQL du container $POSTGRES_CONTAINER pour plus de détails."
+    # preserve temp for debugging then exit
+    echo ""
+    echo "➡️  Command output from container '$POSTGRES_CONTAINER':"
+    docker logs "$POSTGRES_CONTAINER" --tail 50 || true
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
 
 # Restore database
 log_step "Restoring database..."
