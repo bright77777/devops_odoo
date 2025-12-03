@@ -10,148 +10,204 @@ BACKUP_DIR="$PROJECT_ROOT/backup"
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
 [ -f "$ENV_FILE" ] || { log_error ".env not found"; exit 1; }
 set -a; source "$ENV_FILE"; set +a
 
 mkdir -p "$BACKUP_DIR"
-TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-BACKUP_NAME="odoo_backup_${TIMESTAMP}"
-BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
-mkdir -p "$BACKUP_PATH"
 
 echo ""
-echo "🔄 BACKUP ODOO"
+echo "🔄 RESTORE ODOO"
 echo "════════════════════════════════════════════"
 echo ""
 
-# Find containers
-POSTGRES_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=postgres:15" 2>/dev/null | head -1)
-ODOO_CONTAINER=$(docker ps --format "{{.Names}}" -f "ancestor=odoo:19.0" 2>/dev/null | head -1)
+# List available backups
+list_backups() {
+    echo "Available backups:"
+    echo ""
+    echo "LOCAL:"
+    if ls "$BACKUP_DIR"/*.tar.gz >/dev/null 2>&1; then
+        ls -lh "$BACKUP_DIR"/*.tar.gz | awk '{print "  " $9 " (" $5 ")"}'
+    else
+        echo "  (none)"
+    fi
+    
+    echo ""
+    if [ ! -z "$CF_R2_BUCKET" ] && [ "$CF_R2_BUCKET" != "your-bucket-name" ]; then
+        echo "CLOUDFLARE R2:"
+        if AWS_ACCESS_KEY_ID="$CF_R2_ACCESS_KEY_ID" \
+           AWS_SECRET_ACCESS_KEY="$CF_R2_SECRET_ACCESS_KEY" \
+           aws s3 ls "s3://${CF_R2_BUCKET}/" --endpoint-url "$CF_R2_ENDPOINT" 2>/dev/null | grep "tar.gz"; then
+            :
+        else
+            echo "  (none or connection failed)"
+        fi
+    fi
+    echo ""
+}
 
-if [ -z "$POSTGRES_CONTAINER" ]; then
-    POSTGRES_CONTAINER="odoo-db"
-fi
-if [ -z "$ODOO_CONTAINER" ]; then
-    ODOO_CONTAINER="odoo-app"
+# Check arguments
+if [ "$1" == "list" ]; then
+    list_backups
+    exit 0
 fi
 
+if [ -z "$1" ]; then
+    log_error "Usage: ./restore.sh <backup_name_or_file>"
+    echo ""
+    echo "Examples:"
+    echo "  ./restore.sh odoo_backup_2024-01-15_10-30-00        # From R2"
+    echo "  ./restore.sh backup/odoo_backup_2024-01-15.tar.gz   # From local file"
+    echo "  ./restore.sh list                                    # List available backups"
+    echo ""
+    list_backups
+    exit 1
+fi
+
+BACKUP_INPUT="$1"
+BACKUP_FILE=""
+
+# Determine backup source
+if [ -f "$BACKUP_INPUT" ]; then
+    # Local file
+    BACKUP_FILE="$BACKUP_INPUT"
+    log_info "Using local backup: $BACKUP_FILE"
+elif [ -f "$BACKUP_DIR/$BACKUP_INPUT" ]; then
+    # File in backup directory
+    BACKUP_FILE="$BACKUP_DIR/$BACKUP_INPUT"
+    log_info "Using local backup: $BACKUP_FILE"
+elif [ -f "$BACKUP_DIR/${BACKUP_INPUT}.tar.gz" ]; then
+    # File without extension
+    BACKUP_FILE="$BACKUP_DIR/${BACKUP_INPUT}.tar.gz"
+    log_info "Using local backup: $BACKUP_FILE"
+else
+    # Try R2
+    if [ -z "$CF_R2_BUCKET" ] || [ "$CF_R2_BUCKET" == "your-bucket-name" ]; then
+        log_error "Backup not found locally and R2 not configured"
+        exit 1
+    fi
+    
+    log_step "Downloading from R2..."
+    BACKUP_NAME="${BACKUP_INPUT%.tar.gz}"
+    BACKUP_FILE="$BACKUP_DIR/${BACKUP_NAME}.tar.gz"
+    
+    if ! AWS_ACCESS_KEY_ID="$CF_R2_ACCESS_KEY_ID" \
+         AWS_SECRET_ACCESS_KEY="$CF_R2_SECRET_ACCESS_KEY" \
+         aws s3 cp "s3://${CF_R2_BUCKET}/${BACKUP_NAME}.tar.gz" "$BACKUP_FILE" \
+         --endpoint-url "$CF_R2_ENDPOINT"; then
+        log_error "Failed to download from R2"
+        exit 1
+    fi
+    log_info "Downloaded from R2 ✓"
+fi
+
+# Confirm restore
+echo ""
+log_warn "⚠️  WARNING: This will REPLACE all current data!"
+echo ""
+read -p "Type 'YES' to continue: " CONFIRM
+if [ "$CONFIRM" != "YES" ]; then
+    log_info "Restore cancelled"
+    exit 0
+fi
+
+# Extract backup
+TEMP_DIR="$BACKUP_DIR/restore_temp_$$"
+mkdir -p "$TEMP_DIR"
+log_step "Extracting backup..."
+tar xzf "$BACKUP_FILE" -C "$TEMP_DIR"
+BACKUP_CONTENT=$(ls "$TEMP_DIR")
+BACKUP_PATH="$TEMP_DIR/$BACKUP_CONTENT"
+
+if [ ! -f "$BACKUP_PATH/odoo_db.dump" ]; then
+    log_error "Invalid backup: odoo_db.dump not found"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# Use fixed container names from docker-compose.yml
+POSTGRES_CONTAINER="odoo-db"
+ODOO_CONTAINER="odoo-app"
+
+# Check if containers exist and are running
 if ! docker ps --format "{{.Names}}" | grep -q "^${POSTGRES_CONTAINER}$"; then
     log_error "Container $POSTGRES_CONTAINER not running"
-    log_error ""
-    log_error "Available containers:"
-    docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+    log_error "Start infrastructure first with: cd .. && docker compose up -d"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+if ! docker ps --format "{{.Names}}" | grep -q "^${ODOO_CONTAINER}$"; then
+    log_error "Container $ODOO_CONTAINER not running"
+    log_error "Start infrastructure first with: cd .. && docker compose up -d"
+    rm -rf "$TEMP_DIR"
     exit 1
 fi
 
 log_info "Using containers: DB=$POSTGRES_CONTAINER, App=$ODOO_CONTAINER"
 
-# Backup database
-log_step "Backing up database..."
-docker exec "$POSTGRES_CONTAINER" pg_dump -U "${POSTGRES_USER}" -F c "${POSTGRES_DB}" > "$BACKUP_PATH/odoo_db.dump"
-DB_SIZE=$(du -h "$BACKUP_PATH/odoo_db.dump" | cut -f1)
-log_info "Database backed up ($DB_SIZE)"
+# Stop Odoo
+log_step "Stopping Odoo..."
+docker stop "$ODOO_CONTAINER" >/dev/null 2>&1 || true
 
-# Backup filestore
-log_step "Backing up filestore..."
-if docker exec "$ODOO_CONTAINER" test -d /var/lib/odoo 2>/dev/null; then
-    docker exec "$ODOO_CONTAINER" tar czf - -C /var/lib/odoo . 2>/dev/null > "$BACKUP_PATH/odoo_filestore.tar.gz" || {
-        log_info "No filestore data"
-        tar czf "$BACKUP_PATH/odoo_filestore.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
-    }
-    FS_SIZE=$(du -h "$BACKUP_PATH/odoo_filestore.tar.gz" | cut -f1)
-    log_info "Filestore backed up ($FS_SIZE)"
-else
-    tar czf "$BACKUP_PATH/odoo_filestore.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
-    log_info "No filestore found"
+# Drop and recreate database
+log_step "Recreating database..."
+docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};" >/dev/null 2>&1 || true
+docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER};" >/dev/null 2>&1
+
+# Restore database
+log_step "Restoring database..."
+docker exec -i "$POSTGRES_CONTAINER" pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" --no-owner --no-acl < "$BACKUP_PATH/odoo_db.dump"
+log_info "Database restored ✓"
+
+# Restore filestore
+log_step "Restoring filestore..."
+if [ -f "$BACKUP_PATH/odoo_filestore.tar.gz" ]; then
+    docker exec -i "$ODOO_CONTAINER" sh -c "rm -rf /var/lib/odoo/* 2>/dev/null; tar xzf - -C /var/lib/odoo" < "$BACKUP_PATH/odoo_filestore.tar.gz"
+    log_info "Filestore restored ✓"
 fi
 
-# Backup addons
-log_step "Backing up addons..."
-if [ -d "$PROJECT_ROOT/addons" ] && [ "$(ls -A $PROJECT_ROOT/addons 2>/dev/null)" ]; then
-    tar czf "$BACKUP_PATH/odoo_addons.tar.gz" -C "$PROJECT_ROOT" addons
-    ADDONS_SIZE=$(du -h "$BACKUP_PATH/odoo_addons.tar.gz" | cut -f1)
-    log_info "Addons backed up ($ADDONS_SIZE)"
-else
-    tar czf "$BACKUP_PATH/odoo_addons.tar.gz" -C /tmp --files-from=/dev/null 2>/dev/null
-    log_info "No custom addons"
+# Restore addons
+if [ -f "$BACKUP_PATH/odoo_addons.tar.gz" ]; then
+    log_step "Restoring addons..."
+    tar xzf "$BACKUP_PATH/odoo_addons.tar.gz" -C "$PROJECT_ROOT"
+    log_info "Addons restored ✓"
 fi
 
-# Create metadata
-cat > "$BACKUP_PATH/backup.info" <<EOF
-BACKUP_NAME=$BACKUP_NAME
-TIMESTAMP=$TIMESTAMP
-DATE=$(date)
-DATABASE=odoo_db.dump
-FILESTORE=odoo_filestore.tar.gz
-ADDONS=odoo_addons.tar.gz
-POSTGRES_USER=${POSTGRES_USER}
-POSTGRES_DB=${POSTGRES_DB}
-EOF
+# Start Odoo
+log_step "Starting Odoo..."
+docker start "$ODOO_CONTAINER"
 
-# Compress
-log_step "Compressing backup..."
-BACKUP_ARCHIVE="$BACKUP_DIR/${BACKUP_NAME}.tar.gz"
-tar czf "$BACKUP_ARCHIVE" -C "$BACKUP_DIR" "$BACKUP_NAME"
-rm -rf "$BACKUP_PATH"
-
-ARCHIVE_SIZE=$(du -h "$BACKUP_ARCHIVE" | cut -f1)
-log_info "Backup compressed: $ARCHIVE_SIZE"
-
-# Upload to R2
-if [ ! -z "$CF_R2_BUCKET" ] && [ "$CF_R2_BUCKET" != "your-bucket-name" ]; then
-    log_step "Uploading to Cloudflare R2..."
-    
-    if AWS_ACCESS_KEY_ID="$CF_R2_ACCESS_KEY_ID" \
-       AWS_SECRET_ACCESS_KEY="$CF_R2_SECRET_ACCESS_KEY" \
-       aws s3 cp "$BACKUP_ARCHIVE" "s3://${CF_R2_BUCKET}/${BACKUP_NAME}.tar.gz" \
-       --endpoint-url "$CF_R2_ENDPOINT" 2>&1; then
-        log_info "Uploaded to R2 ✓"
-    else
-        log_error "R2 upload failed (backup still available locally)"
+# Wait for Odoo
+log_step "Waiting for Odoo..."
+for i in {1..60}; do
+    if curl -s http://localhost:8069/web >/dev/null 2>&1; then
+        log_info "Odoo ready ✓"
+        break
     fi
-else
-    log_info "R2 not configured - backup kept locally only"
-fi
+    sleep 2
+done
 
-# Cleanup old backups
-if [ ! -z "$BACKUP_RETENTION_DAYS" ] && [ "$BACKUP_RETENTION_DAYS" -gt 0 ]; then
-    log_step "Cleaning old local backups (>${BACKUP_RETENTION_DAYS} days)..."
-    find "$BACKUP_DIR" -name "odoo_backup_*.tar.gz" -type f -mtime +${BACKUP_RETENTION_DAYS} -delete 2>/dev/null || true
-    
-    if [ ! -z "$CF_R2_BUCKET" ] && [ "$CF_R2_BUCKET" != "your-bucket-name" ]; then
-        log_step "Cleaning old R2 backups (>${BACKUP_RETENTION_DAYS} days)..."
-        CUTOFF_DATE=$(date -d "${BACKUP_RETENTION_DAYS} days ago" +%Y-%m-%d 2>/dev/null || date -v-${BACKUP_RETENTION_DAYS}d +%Y-%m-%d 2>/dev/null)
-        
-        AWS_ACCESS_KEY_ID="$CF_R2_ACCESS_KEY_ID" \
-        AWS_SECRET_ACCESS_KEY="$CF_R2_SECRET_ACCESS_KEY" \
-        aws s3 ls "s3://${CF_R2_BUCKET}/" --endpoint-url "$CF_R2_ENDPOINT" 2>/dev/null | \
-        grep "odoo_backup_" | \
-        while read -r line; do
-            FILENAME=$(echo "$line" | awk '{print $4}')
-            FILE_DATE=$(echo "$FILENAME" | grep -oP '\d{4}-\d{2}-\d{2}' | head -1)
-            if [ ! -z "$FILE_DATE" ] && [ "$FILE_DATE" \< "$CUTOFF_DATE" ]; then
-                AWS_ACCESS_KEY_ID="$CF_R2_ACCESS_KEY_ID" \
-                AWS_SECRET_ACCESS_KEY="$CF_R2_SECRET_ACCESS_KEY" \
-                aws s3 rm "s3://${CF_R2_BUCKET}/${FILENAME}" --endpoint-url "$CF_R2_ENDPOINT" 2>/dev/null || true
-            fi
-        done
-    fi
-fi
+# Cleanup
+rm -rf "$TEMP_DIR"
 
 echo ""
 echo "════════════════════════════════════════════"
-echo "✅ BACKUP COMPLETE"
+echo "✅ RESTORE COMPLETE"
 echo "════════════════════════════════════════════"
 echo ""
-echo "Backup: $BACKUP_ARCHIVE"
-echo "Size: $ARCHIVE_SIZE"
+echo "Odoo is running at: http://localhost:8069"
 echo ""
-echo "To restore:"
-echo "  ./scripts/restore.sh $BACKUP_NAME"
-echo ""
+if [ -f "$BACKUP_PATH/backup.info" ]; then
+    echo "Backup info:"
+    cat "$BACKUP_PATH/backup.info" | grep -E "DATE|TIMESTAMP"
+    echo ""
+fi
