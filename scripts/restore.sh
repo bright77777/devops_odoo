@@ -159,14 +159,48 @@ docker stop "$ODOO_CONTAINER" >/dev/null 2>&1 || true
 
 # Drop and recreate database
 log_step "Recreating database..."
-docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
-docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};" >/dev/null 2>&1 || true
-docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -c "CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER};" >/dev/null 2>&1
+
+# Terminate existing connections
+log_info "Terminating existing connections..."
+docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -d postgres -c \
+  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+
+# Drop database
+log_info "Dropping old database..."
+if ! docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -d postgres -c \
+  "DROP DATABASE IF EXISTS ${POSTGRES_DB};" 2>&1; then
+    log_error "Failed to drop database"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# Create database
+log_info "Creating new database..."
+if ! docker exec "$POSTGRES_CONTAINER" psql -U "${POSTGRES_USER}" -d postgres -c \
+  "CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER};" 2>&1; then
+    log_error "Failed to create database"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+log_info "Database recreated ✓"
 
 # Restore database
-log_step "Restoring database..."
-docker exec -i "$POSTGRES_CONTAINER" pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" --no-owner --no-acl < "$BACKUP_PATH/odoo_db.dump"
-log_info "Database restored ✓"
+log_step "Restoring database dump (this may take a few minutes)..."
+if docker exec -i "$POSTGRES_CONTAINER" pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+   --no-owner --no-acl < "$BACKUP_PATH/odoo_db.dump" 2>&1 | tail -5; then
+    log_info "Database restored ✓"
+else
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 1 ]; then
+        # pg_restore returns 1 even on success with warnings
+        log_info "Database restored ✓ (with warnings)"
+    else
+        log_error "Database restore failed with code $EXIT_CODE"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+fi
 
 # Restore filestore
 log_step "Restoring filestore..."
